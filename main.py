@@ -2,6 +2,7 @@ from flatland.evaluators.client import FlatlandRemoteClient
 from flatland.envs.observations import GlobalObsForRailEnv, ObservationBuilder
 import numpy as np
 import time
+
 #####################################################################
 # Instantiate a Remote Client
 #####################################################################
