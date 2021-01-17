@@ -1,29 +1,49 @@
-import keras
-import flatland
-import flatland.core.transitions
+import random
+from collections import deque
+from flatland.envs.malfunction_generators import malfunction_from_params, MalfunctionParameters
 import numpy as np
-import time
-from flatland.envs.observations import TreeObsForRailEnv, GlobalObsForRailEnv
+import torch
+from scripts.agent import Agent
 from flatland.envs.rail_env import RailEnv
-from flatland.envs.rail_generators import random_rail_generator, sparse_rail_generator
+from flatland.envs.rail_generators import sparse_rail_generator
 from flatland.envs.schedule_generators import sparse_schedule_generator
 from flatland.utils.rendertools import RenderTool
+from scripts.process_observation import normalize_observation
+from flatland.envs.observations import TreeObsForRailEnv, GlobalObsForRailEnv
+from flatland.envs.predictions import ShortestPathPredictorForRailEnv
 
-width = 50  # With of map
-height = 50  # Height of map
-nr_trains = 2  # Number of trains that have an assigned task in the env
-cities_in_map = 20  # Number of cities where agents can start or end
-seed = 14  # Random seed
-grid_distribution_of_cities = False  # Type of city distribution, if False cities are randomly placed
-max_rails_between_cities = 1  # Max number of tracks allowed between cities. This is number of entry point to a city
-max_rail_in_cities = 1  # Max number of parallel tracks within a city, representing a realistic trainstation
+from importlib_resources import path
+import backup
+random.seed(1)
+np.random.seed(1)
+"""
+file_name = "./railway/complex_scene.pkl"
+env = RailEnv(width=10,
+              height=20,
+              rail_generator=rail_from_file(file_name),
+              obs_builder_object=TreeObsForRailEnv(max_depth=3, predictor=ShortestPathPredictorForRailEnv()))
+x_dim = env.width
+y_dim = env.height
+"""
 
-rail_generator = sparse_rail_generator(max_num_cities=cities_in_map,
-                                       seed=seed,
-                                       grid_mode=grid_distribution_of_cities,
-                                       max_rails_between_cities=max_rails_between_cities,
-                                       max_rails_in_city=max_rail_in_cities,
-                                       )
+# Parameters for the Environment
+x_dim = 25
+y_dim = 25
+n_agents = 3
+
+# We are training an Agent using the Tree Observation with depth 2
+observation_builder = TreeObsForRailEnv(max_depth=2)
+
+# Use a the malfunction generator to break agents from time to time
+stochastic_data = MalfunctionParameters(malfunction_rate=1./10000,  # Rate of malfunction occurence
+                                        min_duration=15,  # Minimal duration of malfunction
+                                        max_duration=50  # Max duration of malfunction
+                                        )
+
+
+
+# Custom observation builder
+TreeObservation = TreeObsForRailEnv(max_depth=3, predictor=ShortestPathPredictorForRailEnv(50))
 
 # Different agent types (trains) with different speeds.
 speed_ration_map = {1.: 0.25,  # Fast passenger train
@@ -31,80 +51,87 @@ speed_ration_map = {1.: 0.25,  # Fast passenger train
                     1. / 3.: 0.25,  # Slow commuter train
                     1. / 4.: 0.25}  # Slow freight train
 
-schedule_generator = sparse_schedule_generator(speed_ration_map)
+env = RailEnv(width=x_dim,
+              height=y_dim,
+              rail_generator=sparse_rail_generator(max_num_cities=3,
+                                                   # Number of cities in map (where train stations are)
+                                                   seed=1,  # Random seed
+                                                   grid_mode=False,
+                                                   max_rails_between_cities=2,
+                                                   max_rails_in_city=2),
+              schedule_generator=sparse_schedule_generator(speed_ration_map),
+              number_of_agents=n_agents,
+              malfunction_generator_and_process_data=malfunction_from_params(stochastic_data),
+              obs_builder_object=TreeObservation)
+env.reset(True, True)
 
-stochastic_data = {'prop_malfunction': 0.3,  # Percentage of defective agents
-                   'malfunction_rate': 30,  # Rate of malfunction occurence
-                   'min_duration': 3,  # Minimal duration of malfunction
-                   'max_duration': 20  # Max duration of malfunction
-                   }
+observation_helper = TreeObsForRailEnv(max_depth=4, predictor=ShortestPathPredictorForRailEnv())
+env_renderer = RenderTool(env, screen_height=1080, screen_width=1920)
+num_features_per_node = env.obs_builder.observation_dim
 
-observation_builder = GlobalObsForRailEnv()
+tree_depth = 3
+nr_nodes = 0
+for i in range(tree_depth + 1):
+    nr_nodes += np.power(4, i)
+state_size = num_features_per_node * nr_nodes
+action_size = 5
 
-# Relative weights of each cell type to be used by the random rail generators.
-transition_probability = [1.0,  # empty cell - Case 0
-                          1.0,  # Case 1 - straight
-                          1.0,  # Case 2 - simple switch
-                          0.3,  # Case 3 - diamond drossing
-                          0.5,  # Case 4 - single slip
-                          0.5,  # Case 5 - double slip
-                          0.2,  # Case 6 - symmetrical
-                          0.0,  # Case 7 - dead end
-                          0.2,  # Case 8 - turn left
-                          0.2,  # Case 9 - turn right
-                          1.0]  # Case 10 - mirrored switch
+# We set the number of episodes we would like to train on
+n_trials = 10
+max_steps = int(4 * 2 * (20 + env.height + env.width))
+eps = 1.
+eps_end = 0.005
+eps_decay = 0.9995
+action_dict = dict()
+final_action_dict = dict()
+scores_window = deque(maxlen=100)
+done_window = deque(maxlen=100)
+scores = []
+dones_list = []
+action_prob = [0] * action_size
+agent_obs = [None] * env.get_num_agents()
+agent_next_obs = [None] * env.get_num_agents()
+agent = Agent(state_size, action_size)
 
-env = RailEnv(width=width,
-              height=height,
-              rail_generator=rail_generator,
-              schedule_generator=schedule_generator,
-              number_of_agents=nr_trains,
-              obs_builder_object=observation_builder,
-              remove_agents_at_target=True  # Removes agents at the end of their journey to make space for others
-              )
+with path(backup, "iteration_1160_average_-0.190.pth") as file_in:
+    agent.q_network.load_state_dict(torch.load(file_in))
 
-env.reset()
+record_images = False
+frame_step = 0
 
-env_renderer = RenderTool(env,screen_height=1080,  # Adjust these parameters to fit your resolution
-                          screen_width=1920)
+for trials in range(1, n_trials + 1):
 
-def my_controller():
-    """
-    You are supposed to write this controller
-    DO_NOTHING = 0  # implies change of direction in a dead-end!
-    MOVE_LEFT = 1
-    MOVE_FORWARD = 2
-    MOVE_RIGHT = 3
-    STOP_MOVING = 4
+    # Reset environment
+    obs, info = env.reset(True, True)
+    env_renderer.reset()
+    # Build agent specific observations
+    for a in range(env.get_num_agents()):
+        agent_obs[a] = agent_obs[a] = normalize_observation(obs[a], tree_depth, observation_radius=100)
+    # Reset score and done
+    score = 0
+    env_done = 0
 
-    """
-    _action = {}
-    for _idx in range(nr_trains):
-        _action[_idx] = np.random.randint(0, 5)
-    return _action
+    # Run episode
+    for step in range(max_steps):
 
-for step in range(500):
+        # Action
+        for a in range(env.get_num_agents()):
+            if info['action_required'][a]:
+                action = agent.give_action(agent_obs[a], epsilon=0.)
+            else:
+                action = 0
 
-    _action = my_controller()
-    obs, all_rewards, done, info = env.step(_action)
-    if step == 6:
-        print(obs[0][1])
-    print("Rewards: {}, [done={}]".format( all_rewards, done))
-    env_renderer.render_env(show=True, frames=False, show_observations=False)
-    time.sleep(0.02)
+            action_prob[action] += 1
+            action_dict.update({a: action})
+        # Environment step
+        obs, all_rewards, done, _ = env.step(action_dict)
+        env_renderer.render_env(show=True, show_predictions=True, show_observations=False)
+        # Build agent specific observations and normalize
+        for a in range(env.get_num_agents()):
+            if obs[a]:
+                agent_obs[a] = normalize_observation(obs[a], tree_depth, observation_radius=100)
 
-# retea neuronala exemplu
-# input_shape = keras.layers.Input(shape=(80, 80))
-#
-# flat_layer = keras.layers.Flatten()(input_shape)
-# full_connect_1 = keras.layers.Dense(units=400, activation='relu', use_bias=True, )(flat_layer)
-# full_connect_2 = keras.layers.Dense(units=100, activation='relu', use_bias=True, )(flat_layer)
-# softmax_output = keras.layers.Dense(3, activation='softmax', use_bias=False)(full_connect_1)
-# base_model = keras.models.Model(inputs=input_shape, outputs=softmax_output)
-# #base_model = keras.models.load_model("modelwith3outputs")
-# base_model.summary()
-#
-# #reward = keras.layers.Input(shape=(3,), name='reward')
-# train_model = keras.models.Model(inputs=input_shape, outputs=softmax_output)
-#
-# optimizer_adam = keras.optimizers.Adam(learning_rate=0.0001, epsilon=1.0)
+
+        if done['__all__']:
+            break
+
